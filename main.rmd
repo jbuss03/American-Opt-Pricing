@@ -1,0 +1,519 @@
+---
+title: "SPY American Option Pricing Model"
+header-includes:
+  - \usepackage{setspace}\doublespacing
+subtitle: |
+  | FE 620 Final Project
+  |
+  | https://github.com/tej100/American_Opt_Pricing
+  |
+  | I pledge my honor that I have abided by the Stevens Honor System
+  |
+author:
+ - Tejas Appana
+ - Jacob Bussel
+ - Andrew Finn
+ - Amin Labadi
+date: "Last compiled on `r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+runtime: shiny
+urlcolor: blue
+---
+
+## Abstract
+
+## Introduction
+
+## Setup
+
+The following R libraries were utilized throughout our analysis.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(moments)
+library(plotly)
+library(quantmod)
+```
+
+## Data
+
+On December 1st, 2023, the SPDR S&P 500 ETF (SPY) American options chain data was retrieved from the Bloomberg Terminal as an Excel file. The dataset included a total of 160 instances, evenly split between 80 calls and 80 puts. This information encompassed options with 20 different strikes, ranging from \$450 to \$469, with intervals of $1. The options had four distinct expiration dates, corresponding to 2-week, 4-week, 6-week, and 8-week time-to-maturities. The factors available in the dataset were strike price, ticker (which included the contract's expiration date), National Best Bid Offer (NBBO), last price, Bloomberg's market implied volatility, and trade volume.
+
+```{r import_data, echo=FALSE}
+df = read_xlsx("grid1_lmr4qsjv.xlsx", skip = 1, col_names = T)
+```
+
+## Data Cleaning
+
+To ensure data integrity, a comprehensive data cleaning process was conducted, systematically removing any non-numeric or missing values. This meticulous approach aimed to create a dataset devoid of common data input errors and omissions, establishing a solid foundation for further analysis and interpretation. The following bullets some of the preprocessing techniques we implemented.
+
+- **Reformatted** corrupt **column headers** for convenient data frame access.
+- **Removed null rows** in the data set as a result of unnecessary sub headers within the data.
+
+```{r parse}
+# Parse column names
+colnames(df) = sapply(strsplit(colnames(df), "\\.{3}"), function(x) x[1])
+# Remove null rows
+df = df %>% subset(Strike != "ERROR(6)")
+```
+
+- **Filtered** the imported options data by **calls and puts**. This led to the rest of our cleaning to be implemented on each of our call and put dataframes.
+
+```{r split}
+# Split dataset into calls and puts
+calls = df %>%
+  select(1:(ncol(df) %/% 2))
+
+puts = df %>%
+  select((1 + ncol(df) %/% 2):ncol(df))
+```
+
+- Computed the **mid-price**, which is the midpoint between the best bid and best ask, used as the most common reference for the fair market price.
+- **Standardized the units** of all input variables for modeling purposes
+- Removed excess columns not needed for pricing
+
+```{r mid_price}
+# Option price as mid price
+calls = calls %>%
+  mutate(Price = (calls$Bid + calls$Ask) / 2, IVM = IVM / 100) %>%
+  select(-Bid, -Ask, -Last, -Volm)
+puts = puts %>%
+  mutate(Price = (puts$Bid + puts$Ask) / 2, IVM = IVM / 100) %>%
+  select(-Bid, -Ask, -Last, -Volm)
+```
+
+- Stripped the option expiration date from the contract ticker and performed datetime operations to calculate our time-to-maturity, $\tau$.
+
+```{r calc_tau}
+# Tau in annual units from contract expiration
+data_date = as.Date("12/01/23", "%m/%d/%y")
+calls = calls %>%
+  mutate(tau = as.numeric(as.Date(sub(".*?(\\d{1,2}/\\d{1,2}/\\d{2,4}).*", "\\1", Ticker), "%m/%d/%y") - data_date) / 252) %>% select(-Ticker) %>% mutate_all(as.numeric)
+puts = puts %>%
+  mutate(tau = as.numeric(as.Date(sub(".*?(\\d{1,2}/\\d{1,2}/\\d{2,4}).*", "\\1", Ticker), "%m/%d/%y") - data_date) / 252) %>% select(-Ticker) %>% mutate_all(as.numeric)
+```
+
+- Adding a column to keep track of $dt$ for hedging purposes (only demonstrated on call options).
+
+```{r}
+h<-calls$tau/N
+calls<-cbind(calls,h)
+```
+
+- Checking the maximum time-to-maturity in our data set.
+
+```{r}
+max(calls$tau) * 12
+```
+
+Since the data we're working with does not have options of a time-to-maturity greater than 3 months, and all our data is from the option chain of one day, we can use a constant risk-free rate rather than a stochastic rate. As of December 01, 2023 (the day the data was pulled), the 1-month and 3-month SOFR and treasury yields are $\sim 5.4%$, which is what we will use as our proxy for the risk-free rate in our models. The spot price was also \$458.65 at the time the data was pulled (1:30 PM EST). Additionally, SPY pays dividends quarterly and proportional to the dividends paid by the companies in the index. For simplicity, I've set the dividend amount to the average historical amount over the past 4 quarters, multiplied in with the growth factor. Our step-size is arbitrarily set to 200 for accurate yet timely computations.
+
+- Initializing parameters.
+
+```{r init_params}
+rf = 0.054
+S0 = 458.65
+div_freq = 0.25
+div_amt = 1.61
+N = 200
+```
+
+## Methodology (Pricing Model)
+
+Below, we've illustrated our binomial asset pricing model.
+
+```{r option_pricing}
+american_option_price = function(S0, r, sigma, tau, K, steps, opt_type, greeks = TRUE,div_sched = NULL) {
+  
+  # Validating the input parameters
+  if (S0 <= 0 || r <= 0 || sigma <= 0 || tau <= 0 || K <= 0 || steps <= 0) {
+    stop("Input parameters should be positive and non-zero.")
+  }
+  
+  # Calculating the necessary variables
+  dt = tau / steps  # Time step size
+  u = exp(sigma * sqrt(dt))  # Up factor
+  d = 1 / u  # Down factor
+  p = (exp(r * dt) - d) / (u - d)  # Probability of up movement
+  
+  # Adjust stock prices for dividends
+  if (!is.null(div_sched)) {
+    for (i in seq_along(div_sched$time)) {
+      time = div_sched$time[i]
+      amount = div_sched$amount[i]
+      discount_factor = exp(-r * time)
+      S0 = S0 - amount * discount_factor
+    }
+  }
+  
+  # Creating a 2D array to store the stock prices at each node of the tree
+  stock_prices <<- matrix(0, nrow = steps + 1, ncol = steps + 1)
+  
+  # Calculating the stock prices at each node of the tree
+  for (i in seq(1, steps + 1)) {
+    for (j in seq(1, i)) {
+      stock_prices[i, j] <<- S0 * (u ^ (i - j)) * (d ^ (j - 1))
+    }
+  }
+  
+  # Creating a 2D array to store the option values at each node of the tree
+  option_values <<- matrix(0, nrow = steps + 1, ncol = steps + 1)
+  
+  # Calculating the option values at each node of the tree
+  for (i in seq(steps, 0, -1)) {
+    for (j in seq(1, i + 1)) {
+      intr_val = ifelse(opt_type == "put", K - stock_prices[i, j], stock_prices[i, j] - K)
+      if (i == steps) {
+        # At the last step, the option value is the maximum of 0 and the intrinsic value
+        option_values[i, j] <<- max(0, intr_val)
+      } else {
+        # For other steps, the option value is the maximum of the intrinsic value and the discounted expected value
+        option_values[i, j] <<- max(intr_val,
+                                   (p * option_values[i + 1, j] + (1 - p) * option_values[i + 1, j + 1]) * exp(-r * dt)
+        )
+      }
+    }
+  }
+  if(greeks == TRUE){
+    # Returning the option value at the root node of the tree
+    fuu<-option_values[3,1]
+    fud<-option_values[3,2]
+    fdd<-option_values[3,3]
+    Suu<-stock_prices[3,1]
+    Sud<-stock_prices[3,2]
+    Sdd<-stock_prices[3,3]
+    
+    t1<-(fuu-fud)/(Suu-Sud)
+    t2<-(fud-fdd)/(Sud-Sdd)
+    t3<-(Suu-Sdd)/2
+    
+    return(data.frame(est = option_values[1,1], Delta =(option_values[2,1]-option_values[2,2])/(stock_prices[2,1]-stock_prices[2,2]) , Gamma = (t1-t2)/t3, Theta = (fud-option_values[1,1])/(2*dt)))
+  }
+  else{
+    return(option_values[1,1])
+  }
+}
+```
+
+
+```{r create_div_schedule}
+div_sched_calc = function(tau, freq, amt, time_till_next_exdiv=freq) {
+  if (tau < time_till_next_exdiv) return(NULL)
+  time = seq(time_till_next_exdiv, tau, freq)
+  amount = rep(amt, length(time))
+  return(list(time = time, amount = amount))
+}
+```
+
+```{r apply_call_pricing}
+output<-bind_rows(apply(calls, 1, function(row)
+  american_option_price(
+    S0 = S0,
+    r = rf,
+    sigma = row["IVM"],
+    tau = row["tau"],
+    K = row["Strike"],
+    steps = N,
+    opt_type = "call",
+    greeks = TRUE,
+    # data was from 12/01/23, next ex_div data is 12/16/23 -> 16-1=15 days
+    div_sched = div_sched_calc(row["tau"], div_freq, div_amt, 11/252)
+  )
+))
+
+calls<-cbind(calls,output)
+```
+
+```{r apply_put_pricing}
+puts$est <- apply(puts, 1, function(row)
+  american_option_price(
+    S0 = S0,
+    r = rf,
+    sigma = row["IVM"],
+    tau = row["tau"],
+    K = row["Strike"],
+    steps = N,
+    opt_type = "put",
+    greeks = FALSE,
+    # data was from 12/01/23, next ex_div data is 12/16/23 -> 16-1=15 days
+    div_sched = div_sched_calc(row["tau"], div_freq, div_amt, 11/252)
+  )
+)
+
+```
+
+## Calculating the Greeks
+
+We calculated delta, gamma, and theta using analytical approximations which can be seen below. This was chosen in order to save on computation time, as to numerically compute each greek takes roughly double the time of computing the price of the option itself, and these formulas give good approximations.
+
+$$\Delta = \frac{f_u - f_d}{S_u - S_d}$$
+
+$$\Gamma = \frac{\frac{f_{uu}-f_{ud}}{S_{uu}-S_{ud}}-\frac{f_{ud}-f_{dd}}{S_{ud}-S_{dd}}}{\frac{S_{uu}-S_{dd}}{2}}$$
+
+$$\Theta = \frac{f_{ud}-f}{2 \cdot \frac{\tau}{n}}$$
+
+We calculated vega and rho using finite difference methods. The formula for these can be seen below. Originally we were using finite difference methods to calculate more of the Greeks, but ran into some difficulties. The first being that you encounter numerical difficulties when trying to calculate Gamma, this is due to the very small step sizes interacting with the second derivative in a way that causes inaccuracies(via the square in the denominator). It was also inconvenient to have to wait for all the Greeks to be calculated numerically when knitting our document or doing further data exploration. This is why we settled for the approximations above.
+
+$$\upsilon = \frac{A(s,\sigma +\Delta \sigma)-A(s, \sigma - \Delta \sigma)}{2 \cdot \Delta \sigma}$$
+
+$$\rho = \frac{A(s,r +\Delta r)-A(s, r - \Delta r)}{2 \cdot \Delta r}$$
+
+```{r greeks, echo=FALSE}
+
+#Calculate Vega
+vega<-(apply(calls, 1, function(row)
+  american_option_price(
+    S0 = S0,
+    r = rf,
+    sigma = row["IVM"]+(row["IVM"]*row["h"]),
+    tau = row["tau"],
+    K = row["Strike"],
+    steps = N,
+    opt_type = "call",
+    greeks = FALSE,
+    # data was from 12/01/23, next ex_div data is 12/16/23 -> 16-1=15 days
+    div_sched = div_sched_calc(row["tau"], div_freq, div_amt, 11/252)
+  )
+)-apply(calls, 1, function(row)
+  american_option_price(
+    S0 = S0,
+    r = rf,
+    sigma = row["IVM"]-(row["IVM"]*row["h"]),
+    tau = row["tau"],
+    K = row["Strike"],
+    steps = N,
+    opt_type = "call",
+    greeks = FALSE,
+    # data was from 12/01/23, next ex_div data is 12/16/23 -> 16-1=15 days
+    div_sched = div_sched_calc(row["tau"], div_freq, div_amt, 11/252)
+  )
+))/(2*calls$IVM*calls$h)
+
+#Calculate Rho
+rho<-(apply(calls, 1, function(row)
+  american_option_price(
+    S0 = S0,
+    r = rf+(rf*row["h"]),
+    sigma = row["IVM"],
+    tau = row["tau"],
+    K = row["Strike"],
+    steps = N,
+    opt_type = "call",
+    greeks = FALSE,
+    # data was from 12/01/23, next ex_div data is 12/16/23 -> 16-1=15 days
+    div_sched = div_sched_calc(row["tau"], div_freq, div_amt, 11/252)
+  )
+)-apply(calls, 1, function(row)
+  american_option_price(
+    S0 = S0,
+    r = rf-(rf*row["h"]),
+    sigma = row["IVM"],
+    tau = row["tau"],
+    K = row["Strike"],
+    steps = N,
+    opt_type = "call",
+    greeks = FALSE,
+    # data was from 12/01/23, next ex_div data is 12/16/23 -> 16-1=15 days
+    div_sched = div_sched_calc(row["tau"], div_freq, div_amt, 11/252)
+  )
+))/(2*rf*calls$h)
+
+calls<-cbind(calls,vega,rho)
+```
+
+```{r}
+head(calls)
+```
+
+## Evaluating Model Output
+
+### Market vs Model
+
+Looking at the below plot of our model prices vs observed market prices, we see that out model provides a good estimation, but this estimation begins to vary as tau increases. 
+
+```{r}
+plot(calls$Price, col="blue",ylim = c(0,20),main = "Market vs Estimation(Calls)",xlab = "Tau", ylab = "Price in $")
+points(calls$est, col="red")
+legend(0, 20, legend=c("Market Price", "Estimation"),  
+       fill = c("blue","red") 
+)
+```
+
+```{r}
+plot(puts$Price, col="blue",ylim = c(0,20),main = "Market vs Estimation(Puts)",xlab = "Tau", ylab = "Price in $")
+points(puts$est, col="red")
+legend(0, 20, legend=c("Market Price", "Estimation"),  
+       fill = c("blue","red") 
+)
+```
+
+To better identify and quantify this variation, we can plot the MSE of each estimation, which are separated by tau(time to expiry).
+
+```{r}
+diff_squared<-(calls$Price-calls$est)^2
+MSE<-c(sum(diff_squared[1:20])/20,sum(diff_squared[21:40])/20,sum(diff_squared[41:60])/20,sum(diff_squared[61:80])/20)
+tau<-unique(calls$tau)
+
+plot(tau,MSE, main = "MSE vs Tau(Calls)")
+```
+
+Here we can see that our model prices the option with only a two week expiration(the smallest $\tau$) the best, with an average difference of only a couple cents. As tau increases, we can see our model become less and less precise, pricing the longest-dated option dollars away from the true market value.
+
+```{r}
+diff_squared2<-(puts$Price-puts$est)^2
+MSE2<-c(sum(diff_squared2[1:20])/20,sum(diff_squared2[21:40])/20,sum(diff_squared2[41:60])/20,sum(diff_squared2[61:80])/20)
+tau2<-unique(puts$tau)
+
+plot(tau2,MSE2, main = "MSE vs Tau(Puts)")
+```
+
+The same trend can be seen when pricing puts, though to less of a degree as tau increases. This increase in error can likely be attributed to our use of constant interest rates and volatility, which are exacerbated when there is more time for the model to account for. It's also important to note that for both call and put options, we consistently overprice and never under price. This could be attributed toward high volatility or rates the day we took data, with one or both expected to tame in the near future, but this deserves further investigation.
+
+## Evaluating the Greeks
+
+### Delta
+```{r, echo=FALSE}
+plot(calls$Strike[1:20],calls$Delta[1:20], main = "Delta vs Strike",col = "lightblue",xlab = "Strike", ylab = "Delta")
+points(calls$Strike[21:40],calls$Delta[21:40],col = "blue")
+points(calls$Strike[41:60],calls$Delta[41:60],col = "darkblue")
+points(calls$Strike[61:80],calls$Delta[61:80],col = "black")
+legend(450, .4, legend=c("Tau 1", "Tau 2", "Tau 3", "Tau 4"),  
+       fill = c("lightblue","blue","darkblue","black") 
+)
+```
+
+Looking at the plot of delta vs strike, we can see the delta of the options for each expiration date decrease the further out of the money the option is. We can also see that the closer to expiry an option is, the less sensitive it is to the underlying security.
+
+### Gamma
+```{r, echo = FALSE}
+plot(calls$Strike[1:20],calls$Gamma[1:20],ylim=c(0,.04), main = "Gamma vs Strike",col = "chocolate1",xlab = "Strike", ylab = "Gamma")
+points(calls$Strike[21:40],calls$Gamma[21:40],col = "chocolate2")
+points(calls$Strike[41:60],calls$Gamma[41:60],col = "chocolate3")
+points(calls$Strike[61:80],calls$Gamma[61:80],col = "chocolate4")
+legend(450, .011, legend=c("Tau 1", "Tau 2", "Tau 3", "Tau 4"),  
+       fill = c("chocolate1","chocolate2","chocolate3","chocolate4") 
+)
+```
+
+Looking at Gamma, we see it's the largest around the strike, which is in line with conventional option theory. It's also apparent that the closer to expiration the option is, the more sensitive delta is to the underlying security.
+
+### Theta
+```{r, echo = FALSE}
+plot(calls$Strike[1:20],calls$Theta[1:20],ylim = c(-62,-30), main = "Theta vs Strike",col = "coral1",xlab = "Strike", ylab = "Theta")
+points(calls$Strike[21:40],calls$Theta[21:40],col = "coral2")
+points(calls$Strike[41:60],calls$Theta[41:60],col = "coral3")
+points(calls$Strike[61:80],calls$Theta[61:80],col = "coral4")
+legend(465, -50, legend=c("Tau 1", "Tau 2", "Tau 3", "Tau 4"),  
+       fill = c("coral1","coral2","coral3","coral4") 
+)
+```
+
+Theta maintains this trend, with options close to expiration being significantly more sensitive to time decay, nearly double that of its further-dated counterparts.
+
+### Vega
+```{r, echo = FALSE}
+plot(calls$Strike[1:20],calls$vega[1:20],ylim=c(30,95), main = "Vega vs Strike",col = "burlywood",xlab = "Strike", ylab = "Vega")
+points(calls$Strike[21:40],calls$vega[21:40],col = "burlywood2")
+points(calls$Strike[41:60],calls$vega[41:60],col = "burlywood3")
+points(calls$Strike[61:80],calls$vega[61:80],col = "burlywood4")
+legend(449, 99, legend=c("Tau 1", "Tau 2", "Tau 3", "Tau 4"),  
+       fill = c("burlywood","burlywood2","burlywood3","burlywood4") 
+)
+```
+
+Vega is where we see this trend begin to change, as options closer to expiry a significantly less affected by changes in implied volatility. Longer dated options however are impacted by these changes, this is because future volatility becomes more and more uncertain the farther in time you go.
+
+### IVM
+```{r, echo = FALSE}
+plot(calls$Strike[1:20],calls$IVM[1:20],ylim=c(.1,.14), main = "IV vs Strike",col = "aquamarine1",xlab = "Strike", ylab = "IV")
+points(calls$Strike[21:40],calls$IVM[21:40],col = "aquamarine2")
+points(calls$Strike[41:60],calls$IVM[41:60],col = "aquamarine3")
+points(calls$Strike[61:80],calls$IVM[61:80],col = "aquamarine4")
+legend(465, .14, legend=c("Tau 1", "Tau 2", "Tau 3", "Tau 4"),  
+       fill = c("aquamarine1","aquamarine2","aquamarine3","aquamarine4") 
+)
+```
+
+The plot of the volatility smile gives us good insight on why our model may overprice calls more than puts. Looking at the graph we can see it forms more of a volatility "smirk" rather than a "smile". The higher implied volatility for the options with the lower strike, imply that the market is pricing in a downwards move in the future. This makes sense as to why our puts would be more inline with market values as opposed to our calls.
+
+```{r, eval=FALSE, include=FALSE}
+Moneyness <- unique((S0-calls$Strike)/S0)
+Maturity <- unique(calls$tau*252)
+IV <- as.matrix(data.frame(calls$IVM[1:20],calls$IVM[21:40],calls$IVM[41:60],calls$IVM[61:80]))
+
+
+
+axx = list(title = "x: Moneyness (in %, Neg. values are OTM call)")
+axy = list(title = "y: Time to Maturity (in days)")
+axz = list(title = "z: Implied Volatility")
+
+plot_ly(x=~Moneyness, y=~Maturity, z=~IV) %>% 
+    add_surface() %>%
+    layout(title = "December 1st, 2023 SPY Option Vol Surface",
+           scene = list(xaxis=axx,yaxis=axy,zaxis=axz))
+
+```
+
+### Rho
+```{r, echo = FALSE}
+plot(calls$Strike[1:20],calls$rho[1:20],ylim=c(0,80), main = "Rho vs Strike",col = "cyan1",xlab = "Strike", ylab = "Rho")
+points(calls$Strike[21:40],calls$rho[21:40],col = "cyan2")
+points(calls$Strike[41:60],calls$rho[41:60],col = "cyan3")
+points(calls$Strike[61:80],calls$rho[61:80],col = "cyan4")
+legend(465, 80, legend=c("Tau 1", "Tau 2", "Tau 3", "Tau 4"),  
+       fill = c("cyan1","cyan2","cyan3","cyan4") 
+)
+```
+
+Finally, Rho exhibits a similar trend as vega, with further dated options being a lot more susceptible to changes in interest rates. This is fore the same reason, that the further aheaed you go in time, the more uncertain future rates become.
+
+## Delta Hedging
+
+```{r, echo = FALSE}
+getSymbols("SPY", from = "2023-12-01")
+S<-SPY$SPY.Adjusted
+
+#Choose K = 458 for this exercise
+tau1_K458_puts<-c(puts[9,c(1:4)])
+
+delta_hedge<-american_option_price(
+    S0 = S$SPY.Adjusted[1],
+    r = rf,
+    sigma = tau1_K458_puts$IVM,
+    tau = tau1_K458_puts$tau-(1/252),
+    K = tau1_K458_puts$Strike,
+    steps = N,
+    opt_type = "put",
+    greeks = TRUE,
+    # data was from 12/01/23, next ex_div data is 12/16/23 -> 16-1=15 days
+    div_sched = div_sched_calc(tau1_K458_puts$tau, div_freq, div_amt, 11/252)
+  )
+
+for(i in c(2:length(S$SPY.Adjusted))){
+  delta_hedge<-rbind(delta_hedge,american_option_price(
+    S0 = S$SPY.Adjusted[i],
+    r = rf,
+    sigma = tau1_K458_puts$IVM,
+    tau = tau1_K458_puts$tau-(i/252),
+    K = tau1_K458_puts$Strike,
+    steps = N,
+    opt_type = "put",
+    greeks = TRUE,
+    # data was from 12/01/23, next ex_div data is 12/16/23 -> 16-1=15 days
+    div_sched = div_sched_calc(tau1_K458_puts$tau-(i/252), div_freq, div_amt, 11/252)
+  ))
+  
+}
+
+Put_diff<-data.frame(c(0,delta_hedge[-1,1]-delta_hedge[-9,1]))
+delta_1<-data.frame(c(0,delta_hedge[-9,2]))
+price_diff<-data.frame(c(0,as.vector(S[-1])-as.vector(S[-9])))
+
+delta_hedge<-cbind(data.frame(S),delta_hedge[,c(1,2)],Put_diff,delta_1*price_diff)
+
+colnames(delta_hedge)<-c("S", "Est", "Delta", "P(t) - P(t-1)", "Pi(t) - Pi(t-1)")
+  
+delta_hedge                                                            
+```
